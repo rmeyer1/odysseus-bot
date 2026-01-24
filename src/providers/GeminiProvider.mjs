@@ -2,10 +2,9 @@ import fs from "node:fs";
 import BaseProvider from "./BaseProvider.mjs";
 import { GEMINI_API_KEY, GEMINI_MODEL } from "../config.mjs";
 import { nowIso, sleep } from "../utils/common.mjs";
+import { getCodexSystemPrompt } from "../commands/codex.mjs";
 
-const SYSTEM_PROMPT =
-  "You are a Senior Full-Stack Engineer. Provide concise, high-quality answers. " +
-  "When you output code, use Markdown code blocks. If you use external sources, include citations.";
+const SYSTEM_PROMPT = getCodexSystemPrompt();
 
 function shouldUseSearch(prompt) {
   const p = String(prompt || "").toLowerCase();
