@@ -22,6 +22,7 @@ export function buildCodexArgs(prompt, workdir) {
 
 export function getCodexSystemPrompt() {
   return [
+    "You are a Principal Software Engineer.",
     "You are operating in a local git repo. Follow these constraints:",
     "- Keep output concise. Do NOT paste large diffs into the chat output.",
     "- If you generate a diff, write it to a patch file instead (e.g. /tmp/changes.patch).",
