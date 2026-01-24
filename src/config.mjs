@@ -1,5 +1,8 @@
 import os from "node:os";
 import path from "node:path";
+import dotenv from 'dotenv';
+
+dotenv.config();
 
 export const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 export const ALLOWED_CHAT_ID = process.env.ALLOWED_CHAT_ID ? String(process.env.ALLOWED_CHAT_ID) : null;
