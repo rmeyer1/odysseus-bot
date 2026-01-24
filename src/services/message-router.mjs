@@ -4,6 +4,7 @@ import {
   ALLOWED_CHAT_ID,
   CODEX_BIN,
   CODEX_MODEL,
+  GEMINI_MODEL,
   JOB_LOGS_DIR,
   MAX_INLINE_OUTPUT_CHARS,
   MEMORY_HIGH_MB,
@@ -13,27 +14,29 @@ import {
   WORKDIR,
 } from "../config.mjs";
 import { createRepomixCommand } from "../commands/repomix.mjs";
-import { exec, formatBytes, getSystemMemInfo, nowIso } from "../utils/common.mjs";
+import { exec, formatBytes, getSystemMemInfo } from "../utils/common.mjs";
 import {
   getChatWorkdir,
   listReposUnderBaseDir,
   resolveRepoToWorkdir,
   updateChatRepo,
 } from "./repo-manager.mjs";
-import { getJob, loadJobs, saveJobs, upsertJob } from "./job-db.mjs";
+import { getJob, loadJobs } from "./job-db.mjs";
+import { getChatProvider, setChatProvider } from "./provider-state.mjs";
 
 function isAllowed(msg) {
   if (!ALLOWED_CHAT_ID) return true;
   return String(msg?.chat?.id) === ALLOWED_CHAT_ID;
 }
 
-export function createMessageHandler({ sendMessageSafe, sendDocumentSafe, enqueueJob }) {
+export function createMessageHandler({ sendMessageSafe, sendDocumentSafe, enqueueJob, cancelJob }) {
   const runRepomixCommand = createRepomixCommand({ sendMessageSafe, sendDocumentSafe });
 
-  async function queueCodexJob(chatId, prompt) {
+  async function queueJob(chatId, prompt, providerOverride = null) {
     const workdir = getChatWorkdir(chatId);
-    const id = await enqueueJob(chatId, prompt, { workdir });
-    return { id, workdir };
+    const provider = providerOverride || getChatProvider(chatId);
+    const id = await enqueueJob(chatId, prompt, { workdir, provider });
+    return { id, workdir, provider };
   }
 
   return async function onMessage(msg) {
@@ -75,8 +78,18 @@ export function createMessageHandler({ sendMessageSafe, sendDocumentSafe, enqueu
         return sendMessageSafe(chatId, `✅ Switched repo.\nWORKDIR:\n${wd}`);
       }
 
+      if (text.startsWith("/setprovider")) {
+        const token = text.replace("/setprovider", "").trim().toLowerCase();
+        if (!token || !["codex", "gemini"].includes(token)) {
+          return sendMessageSafe(chatId, "Usage: /setprovider <codex|gemini>");
+        }
+        setChatProvider(chatId, token);
+        return sendMessageSafe(chatId, `✅ Default provider set to: ${token}`);
+      }
+
       if (text === "/start" || text === "/help") {
         const wd = getChatWorkdir(chatId);
+        const provider = getChatProvider(chatId);
         return sendMessageSafe(
           chatId,
           [
@@ -87,11 +100,16 @@ export function createMessageHandler({ sendMessageSafe, sendDocumentSafe, enqueu
             "/repos                  - list git repos under REPOS_BASE_DIR",
             "/setrepo <name|path>    - set current repo for this chat",
             "",
+            "Providers:",
+            "/setprovider <codex|gemini> - set default provider for this chat",
+            "/ask <prompt>               - run with default provider",
+            "/codex <prompt>             - force local Codex CLI",
+            "/gemini <prompt>            - force Gemini API",
+            "",
             "Commands:",
             "/status                 - git status -sb (current repo)",
             "/diff                   - git diff (current repo)",
             "/pull                   - git pull (current repo)",
-            "/codex <task>           - create job (big-task mode; runs in current repo at queue time)",
             "/repomix [style] [opts] - pack repo + send file (style: xml|markdown|json|plain; opts: diffs logs compress parsable linenumbers)",
             "/jobs                   - list recent jobs",
             "/job <id>               - show job status",
@@ -103,7 +121,9 @@ export function createMessageHandler({ sendMessageSafe, sendDocumentSafe, enqueu
             `Current repo: ${wd}`,
             `Default WORKDIR: ${WORKDIR}`,
             `REPOS_BASE_DIR: ${REPOS_BASE_DIR}`,
+            `Default provider: ${provider}`,
             `Codex model: ${CODEX_MODEL}`,
+            `Gemini model: ${GEMINI_MODEL}`,
             `Unsafe sandbox bypass: ${USE_UNSAFE_CODEX ? "ON" : "OFF"}`,
           ].join("\n")
         );
@@ -188,7 +208,7 @@ export function createMessageHandler({ sendMessageSafe, sendDocumentSafe, enqueu
         const prompt =
           "Create a compact project memory summary (max 200 lines) that preserves key architecture, " +
           "important file paths, and current open work. Output as a bullet list titled 'COMPRESSED MEMORY'.";
-        const { id } = await queueCodexJob(chatId, prompt);
+        const { id } = await queueJob(chatId, prompt, "codex");
         return sendMessageSafe(chatId, `🗜️ Compress fallback started as job ${id}. Use /job ${id}`);
       }
 
@@ -204,7 +224,8 @@ export function createMessageHandler({ sendMessageSafe, sendDocumentSafe, enqueu
         const lines = recent.map((j) => {
           const s = j.status.padEnd(9);
           const repoSuffix = j.workdir ? `  (${path.basename(j.workdir)})` : "";
-          return `${j.id}  ${s}  ${j.createdAt.replace("T", " ").slice(0, 19)}${repoSuffix}`;
+          const provider = j.provider ? `  [${j.provider}]` : "";
+          return `${j.id}  ${s}  ${j.createdAt.replace("T", " ").slice(0, 19)}${repoSuffix}${provider}`;
         });
         return sendMessageSafe(chatId, `Recent jobs:\n${lines.join("\n")}`);
       }
@@ -229,6 +250,7 @@ export function createMessageHandler({ sendMessageSafe, sendDocumentSafe, enqueu
         const lines = [
           `Job ${j.id}`,
           `Status: ${j.status}`,
+          `Provider: ${j.provider || "codex"}`,
           `Repo: ${j.workdir || WORKDIR}`,
           `Created: ${j.createdAt}`,
           j.startedAt ? `Started: ${j.startedAt}` : null,
@@ -252,20 +274,14 @@ export function createMessageHandler({ sendMessageSafe, sendDocumentSafe, enqueu
         const id = text.replace("/cancel", "").trim();
         if (!id) return sendMessageSafe(chatId, "Usage: /cancel <id>");
 
-        const db = loadJobs();
-        const j = getJob(db, id);
-        if (!j || j.chatId !== chatId) return sendMessageSafe(chatId, "Job not found.");
-
-        if (j.status !== "running") return sendMessageSafe(chatId, `Job ${id} is not running (status: ${j.status}).`);
-
-        try {
-          if (j.pid) process.kill(j.pid, "SIGKILL");
-        } catch {}
-
-        j.status = "canceled";
-        j.updatedAt = nowIso();
-        upsertJob(db, j);
-        saveJobs(db);
+        const result = await cancelJob(chatId, id);
+        if (!result.ok) {
+          if (result.reason === "not_found") return sendMessageSafe(chatId, "Job not found.");
+          if (result.reason === "not_running") {
+            return sendMessageSafe(chatId, `Job ${id} is not running (status: ${result.status}).`);
+          }
+          return sendMessageSafe(chatId, "Cancel failed.");
+        }
 
         return sendMessageSafe(chatId, `🛑 Canceled job ${id}.`);
       }
@@ -274,8 +290,29 @@ export function createMessageHandler({ sendMessageSafe, sendDocumentSafe, enqueu
         const prompt = text.replace("/codex", "").trim();
         if (!prompt) return sendMessageSafe(chatId, "Usage: /codex <task>");
 
-        const { id } = await queueCodexJob(chatId, prompt);
+        const { id } = await queueJob(chatId, prompt, "codex");
         return sendMessageSafe(chatId, `✅ Queued job ${id}. Use /job ${id} or /jobs.`);
+      }
+
+      if (text.startsWith("/gemini ")) {
+        const prompt = text.replace("/gemini", "").trim();
+        if (!prompt) return sendMessageSafe(chatId, "Usage: /gemini <task>");
+
+        const { id } = await queueJob(chatId, prompt, "gemini");
+        return sendMessageSafe(chatId, `✅ Queued job ${id}. Use /job ${id} or /jobs.`);
+      }
+
+      if (text.startsWith("/ask ")) {
+        const prompt = text.replace("/ask", "").trim();
+        if (!prompt) return sendMessageSafe(chatId, "Usage: /ask <task>");
+
+        const { id, provider } = await queueJob(chatId, prompt);
+        return sendMessageSafe(chatId, `✅ Queued job ${id} via ${provider}. Use /job ${id} or /jobs.`);
+      }
+
+      if (!text.startsWith("/")) {
+        const { id, provider } = await queueJob(chatId, text);
+        return sendMessageSafe(chatId, `✅ Queued job ${id} via ${provider}. Use /job ${id} or /jobs.`);
       }
 
       return sendMessageSafe(chatId, "Unknown command. Try /help");

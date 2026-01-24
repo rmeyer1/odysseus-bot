@@ -27,6 +27,10 @@ export const JOB_LOGS_DIR = path.join(JOBS_DIR, "logs");
 export const MAX_INLINE_OUTPUT_CHARS = Number(process.env.MAX_INLINE_OUTPUT_CHARS || 12000);
 export const MEMORY_HIGH_MB = Number(process.env.MEMORY_HIGH_MB || 900);
 
+// Gemini
+export const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
+export const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-pro";
+
 // Repomix
 export const REPOMIX_BIN = process.env.REPOMIX_BIN || "repomix";
 export const REPOMIX_TIMEOUT_MS = Number(process.env.REPOMIX_TIMEOUT_MS || 30 * 60 * 1000);
@@ -35,6 +39,7 @@ export const REPOMIX_DEFAULT_STYLE = (process.env.REPOMIX_DEFAULT_STYLE || "xml"
 // Repo switching
 export const REPOS_BASE_DIR = process.env.REPOS_BASE_DIR || path.join(os.homedir(), "Projects", "work");
 export const CHAT_REPO_DB_PATH = path.join(JOBS_DIR, "chat-repos.json");
+export const PROVIDER_DB_PATH = path.join(JOBS_DIR, "chat-providers.json");
 
 if (!BOT_TOKEN) throw new Error("Missing TELEGRAM_BOT_TOKEN");
 // Keep WORKDIR required as your safe default (backward compatible)
