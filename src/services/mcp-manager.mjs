@@ -7,9 +7,17 @@ const CONFIG_PATH = path.resolve(process.cwd(), 'mcp.json');
 let activeClients = []; // Store all connected clients
 
 // Helper to replace ${VAR} with actual env values
-function expandEnv(str) {
-  if (typeof str !== 'string') return str;
-  return str.replace(/\$\{(.+?)\}/g, (_, v) => process.env[v] || '');
+function expandEnv(value) {
+  if (Array.isArray(value)) return value.map((item) => expandEnv(item));
+  if (value && typeof value === 'object') {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) out[k] = expandEnv(v);
+    return out;
+  }
+  if (typeof value === 'string') {
+    return value.replace(/\$\{(.+?)\}/g, (_m, v) => process.env[v] || '');
+  }
+  return value;
 }
 
 /**
@@ -55,18 +63,14 @@ export async function startMcpServers() {
 
   for (const [serverName, settings] of Object.entries(config)) {
     try {
+      const expandedSettings = expandEnv(settings);
       // 1. Prepare Environment Variables
-      const envVars = { ...process.env };
-      if (settings.env) {
-        for (const [k, v] of Object.entries(settings.env)) {
-          envVars[k] = expandEnv(v);
-        }
-      }
+      const envVars = { ...process.env, ...(expandedSettings.env || {}) };
 
       // 2. Setup Transport
       const transport = new StdioClientTransport({
-        command: settings.command,
-        args: settings.args || [],
+        command: expandedSettings.command,
+        args: expandedSettings.args || [],
         env: envVars
       });
 
