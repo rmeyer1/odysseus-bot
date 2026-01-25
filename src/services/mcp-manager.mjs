@@ -13,36 +13,33 @@ function expandEnv(str) {
 }
 
 /**
- * 🧹 SANITIZER: Recursively removes fields that Gemini hates ($schema, additionalProperties)
+ * 🧹 SANITIZER: Allow-list only Gemini-compatible schema fields.
  */
 function cleanGeminiSchema(schema) {
   if (!schema || typeof schema !== 'object') return schema;
 
-  // 1. Create a shallow copy so we don't mutate the original
-  const clean = Array.isArray(schema) ? [...schema] : { ...schema };
+  const out = {};
 
-  // 2. Remove forbidden keys
-  delete clean.additionalProperties;
-  delete clean.$schema;
-  
-  // 3. Recurse into known nested schema structures
-  if (clean.properties) {
-    for (const key in clean.properties) {
-      clean.properties[key] = cleanGeminiSchema(clean.properties[key]);
+  if (schema.type) out.type = schema.type;
+  if (schema.format) out.format = schema.format;
+  if (schema.description) out.description = schema.description;
+  if (schema.nullable) out.nullable = schema.nullable;
+  if (schema.enum) out.enum = schema.enum;
+  if (schema.required) out.required = schema.required;
+
+  if (schema.properties && typeof schema.properties === 'object') {
+    out.properties = {};
+    for (const key of Object.keys(schema.properties)) {
+      out.properties[key] = cleanGeminiSchema(schema.properties[key]);
     }
   }
-  if (clean.items) {
-    clean.items = cleanGeminiSchema(clean.items);
-  }
-  // Handle array-based combinators (anyOf, allOf, oneOf)
-  ['anyOf', 'allOf', 'oneOf'].forEach(combinator => {
-    if (clean[combinator] && Array.isArray(clean[combinator])) {
-      clean[combinator] = clean[combinator].map(cleanGeminiSchema);
-    }
-  });
 
-  return clean;
+  if (schema.items) out.items = cleanGeminiSchema(schema.items);
+
+  return out;
 }
+
+const toolRegistry = new Map();
 
 export async function loadMcpConfig() {
   if (!fs.existsSync(CONFIG_PATH)) return {};
@@ -95,20 +92,21 @@ export async function startMcpServers() {
 export async function getAllMcpTools() {
   await startMcpServers();
   let allTools = [];
+  toolRegistry.clear();
 
   for (const { name, client } of activeClients) {
     try {
       const list = await client.listTools();
       const tools = list.tools.map(t => {
-        // --- APPLY THE FIX HERE ---
-        const sanitizedSchema = cleanGeminiSchema(t.inputSchema); 
+        const sanitizedSchema = cleanGeminiSchema(t.inputSchema);
+        const geminiName = `${name}_${t.name}`.replace(/-/g, '_');
+
+        toolRegistry.set(geminiName, { client, toolName: t.name });
 
         return {
-          ...t,
-          inputSchema: sanitizedSchema, // Use the clean version
-          originalName: t.name, // Keep track of real name for execution
-          name: `${name}_${t.name}`.replace(/-/g, '_'), // Sanitized for Gemini
-          _client: client // Hidden reference to the client that owns this tool
+          name: geminiName,
+          description: t.description || '',
+          inputSchema: sanitizedSchema
         };
       });
       allTools.push(...tools);
@@ -121,13 +119,13 @@ export async function getAllMcpTools() {
 
 // Execute a tool by finding the right client
 export async function executeMcpTool(geminiToolName, args) {
-  const tools = await getAllMcpTools();
-  const toolDef = tools.find(t => t.name === geminiToolName);
+  if (!toolRegistry.size) await getAllMcpTools();
+  const entry = toolRegistry.get(geminiToolName);
 
-  if (!toolDef) throw new Error(`Tool ${geminiToolName} not found.`);
+  if (!entry) throw new Error(`Tool ${geminiToolName} not found.`);
 
-  const result = await toolDef._client.callTool({
-    name: toolDef.originalName,
+  const result = await entry.client.callTool({
+    name: entry.toolName,
     arguments: args
   });
 
