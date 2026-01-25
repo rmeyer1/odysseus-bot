@@ -1,134 +1,135 @@
-import fs from "node:fs";
-import path from "node:path";
+import fs from 'node:fs';
+import path from 'node:path';
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { CallToolResultSchema, ListToolsResultSchema } from "@modelcontextprotocol/sdk/types.js";
 
-const MCP_CONFIG_PATH = path.join(process.cwd(), "mcp.json");
+const CONFIG_PATH = path.resolve(process.cwd(), 'mcp.json');
+let activeClients = []; // Store all connected clients
 
-let started = false;
-const servers = new Map();
-const toolAliasMap = new Map();
-const toolDecls = [];
-
-function substituteEnvVars(input) {
-  if (Array.isArray(input)) return input.map((v) => substituteEnvVars(v));
-  if (input && typeof input === "object") {
-    const out = {};
-    for (const [k, v] of Object.entries(input)) out[k] = substituteEnvVars(v);
-    return out;
-  }
-  if (typeof input === "string") {
-    return input.replace(/\$\{([A-Z0-9_]+)\}/g, (_m, name) => process.env[name] ?? "");
-  }
-  return input;
+// Helper to replace ${VAR} with actual env values
+function expandEnv(str) {
+  if (typeof str !== 'string') return str;
+  return str.replace(/\$\{(.+?)\}/g, (_, v) => process.env[v] || '');
 }
 
-function safeToolName(name) {
-  return String(name || "")
-    .trim()
-    .replace(/[^a-zA-Z0-9_]+/g, "_")
-    .replace(/^_+|_+$/g, "")
-    .slice(0, 64);
-}
+/**
+ * 🧹 SANITIZER: Recursively removes fields that Gemini hates ($schema, additionalProperties)
+ */
+function cleanGeminiSchema(schema) {
+  if (!schema || typeof schema !== 'object') return schema;
 
-function addTool(serverName, tool) {
-  const base = safeToolName(`${serverName}_${tool.name}`);
-  let alias = base || safeToolName(tool.name) || "tool";
-  let i = 2;
-  while (toolAliasMap.has(alias)) {
-    alias = `${base}_${i++}`;
+  // 1. Create a shallow copy so we don't mutate the original
+  const clean = Array.isArray(schema) ? [...schema] : { ...schema };
+
+  // 2. Remove forbidden keys
+  delete clean.additionalProperties;
+  delete clean.$schema;
+  
+  // 3. Recurse into known nested schema structures
+  if (clean.properties) {
+    for (const key in clean.properties) {
+      clean.properties[key] = cleanGeminiSchema(clean.properties[key]);
+    }
   }
-
-  toolAliasMap.set(alias, { serverName, toolName: tool.name });
-
-  const parameters = tool.inputSchema || { type: "object" };
-
-  toolDecls.push({
-    name: alias,
-    description: tool.description ? `[${serverName}] ${tool.description}` : `[${serverName}]`,
-    parameters,
+  if (clean.items) {
+    clean.items = cleanGeminiSchema(clean.items);
+  }
+  // Handle array-based combinators (anyOf, allOf, oneOf)
+  ['anyOf', 'allOf', 'oneOf'].forEach(combinator => {
+    if (clean[combinator] && Array.isArray(clean[combinator])) {
+      clean[combinator] = clean[combinator].map(cleanGeminiSchema);
+    }
   });
+
+  return clean;
 }
 
-export function loadMcpConfig() {
-  if (!fs.existsSync(MCP_CONFIG_PATH)) return null;
-  const raw = fs.readFileSync(MCP_CONFIG_PATH, "utf8");
-  const parsed = JSON.parse(raw);
-  if (parsed.mcpServers && typeof parsed.mcpServers === "object") return parsed.mcpServers;
-  return parsed;
+export async function loadMcpConfig() {
+  if (!fs.existsSync(CONFIG_PATH)) return {};
+  const raw = fs.readFileSync(CONFIG_PATH, 'utf8');
+  return JSON.parse(raw);
 }
 
 export async function startMcpServers() {
-  if (started) return;
-  started = true;
+  if (activeClients.length > 0) return activeClients;
 
-  const config = loadMcpConfig();
-  if (!config || typeof config !== "object" || !Object.keys(config).length) return;
+  const config = await loadMcpConfig();
+  console.log(`🔌 Found ${Object.keys(config).length} MCP servers in config.`);
 
-  console.log("🔌 Found MCP servers in config.");
-
-  const entries = Object.entries(config);
-  for (const [name, cfg] of entries) {
-    if (!cfg?.command) continue;
-
-    const resolved = substituteEnvVars(cfg);
-    const transport = new StdioClientTransport({
-      command: resolved.command,
-      args: resolved.args || [],
-      env: resolved.env ? { ...process.env, ...resolved.env } : process.env,
-    });
-
-    const client = new Client({ name: "odysseus-bot", version: "1.0.0" });
-    await client.connect(transport);
-
-    servers.set(name, { client });
-  }
-
-  await refreshTools();
-}
-
-async function refreshTools() {
-  toolAliasMap.clear();
-  toolDecls.length = 0;
-
-  for (const [serverName, { client }] of servers.entries()) {
+  for (const [serverName, settings] of Object.entries(config)) {
     try {
-      const result = await client.request({ method: "tools/list" }, ListToolsResultSchema);
-      const tools = result?.tools || [];
-      for (const tool of tools) addTool(serverName, tool);
+      // 1. Prepare Environment Variables
+      const envVars = { ...process.env };
+      if (settings.env) {
+        for (const [k, v] of Object.entries(settings.env)) {
+          envVars[k] = expandEnv(v);
+        }
+      }
+
+      // 2. Setup Transport
+      const transport = new StdioClientTransport({
+        command: settings.command,
+        args: settings.args || [],
+        env: envVars
+      });
+
+      // 3. Connect Client
+      const client = new Client(
+        { name: "codex-bot", version: "1.0.0" },
+        { capabilities: { sampling: {} } }
+      );
+
+      await client.connect(transport);
+      console.log(`✅ MCP Server '${serverName}' connected.`);
+      
+      activeClients.push({ name: serverName, client });
     } catch (e) {
-      console.error(`[mcp] failed to list tools for ${serverName}:`, e?.message || e);
+      console.error(`❌ Failed to start MCP server '${serverName}':`, e.message);
     }
   }
+
+  return activeClients;
 }
 
+// Get all tools from ALL connected servers combined
 export async function getAllMcpTools() {
   await startMcpServers();
-  return toolDecls.slice();
+  let allTools = [];
+
+  for (const { name, client } of activeClients) {
+    try {
+      const list = await client.listTools();
+      const tools = list.tools.map(t => {
+        // --- APPLY THE FIX HERE ---
+        const sanitizedSchema = cleanGeminiSchema(t.inputSchema); 
+
+        return {
+          ...t,
+          inputSchema: sanitizedSchema, // Use the clean version
+          originalName: t.name, // Keep track of real name for execution
+          name: `${name}_${t.name}`.replace(/-/g, '_'), // Sanitized for Gemini
+          _client: client // Hidden reference to the client that owns this tool
+        };
+      });
+      allTools.push(...tools);
+    } catch (e) {
+      console.error(`⚠️ Could not list tools for ${name}:`, e.message);
+    }
+  }
+  return allTools;
 }
 
-export async function executeMcpTool(alias, args) {
-  const entry = toolAliasMap.get(alias);
-  if (!entry) throw new Error(`Unknown MCP tool: ${alias}`);
+// Execute a tool by finding the right client
+export async function executeMcpTool(geminiToolName, args) {
+  const tools = await getAllMcpTools();
+  const toolDef = tools.find(t => t.name === geminiToolName);
 
-  const server = servers.get(entry.serverName);
-  if (!server) throw new Error(`MCP server not found: ${entry.serverName}`);
+  if (!toolDef) throw new Error(`Tool ${geminiToolName} not found.`);
 
-  const result = await server.client.request(
-    {
-      method: "tools/call",
-      params: {
-        name: entry.toolName,
-        arguments: args || {},
-      },
-    },
-    CallToolResultSchema
-  );
+  const result = await toolDef._client.callTool({
+    name: toolDef.originalName,
+    arguments: args
+  });
 
-  return {
-    name: entry.toolName,
-    isError: result?.isError || false,
-    content: result?.content || [],
-  };
+  return result.content.map(c => c.text).join('\n');
 }
