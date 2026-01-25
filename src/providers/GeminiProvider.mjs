@@ -6,7 +6,7 @@ import { getCodexSystemPrompt } from "../commands/codex.mjs";
 import { executeMcpTool, getAllMcpTools, startMcpServers } from "../services/mcp-manager.mjs";
 
 const SYSTEM_PROMPT = getCodexSystemPrompt();
-const MAX_TOOL_LOOPS = 3;
+const MAX_TOOL_LOOPS = 5; // Increased slightly for complex GitHub chains
 
 function shouldUseSearch(prompt) {
   const p = String(prompt || "").toLowerCase();
@@ -59,6 +59,9 @@ export default class GeminiProvider extends BaseProvider {
 
     await startMcpServers();
     const mcpToolsRaw = await getAllMcpTools();
+    
+    // We map the tools here. 
+    // Note: ensure your mcp-manager.mjs handles the schema sanitization (stripping $schema)
     const mcpToolDecls = mcpToolsRaw.map((t) => ({
       name: t.name,
       description: t.description,
@@ -71,8 +74,11 @@ export default class GeminiProvider extends BaseProvider {
     if (useSearch) tools.push({ googleSearch: {} });
     if (mcpToolDecls.length) tools.push({ functionDeclarations: mcpToolDecls });
 
+    // Use the requested model, falling back to config
+    const modelName = process.env.GEMINI_MODEL || GEMINI_MODEL || "gemini-1.5-pro";
+
     const model = genAI.getGenerativeModel({
-      model: GEMINI_MODEL,
+      model: modelName,
       systemInstruction: {
         role: "system",
         parts: [{ text: SYSTEM_PROMPT }],
@@ -82,7 +88,7 @@ export default class GeminiProvider extends BaseProvider {
 
     const outStream = fs.createWriteStream(logPath, { flags: "a" });
     outStream.write(
-      `== job ${job.id} ==\nstarted: ${nowIso()}\nprovider: gemini\nmodel: ${GEMINI_MODEL}\nworkdir: ${workdir}\n\n`
+      `== job ${job.id} ==\nstarted: ${nowIso()}\nprovider: gemini\nmodel: ${modelName}\nworkdir: ${workdir}\n\n`
     );
 
     let combinedTail = "";
@@ -101,31 +107,56 @@ export default class GeminiProvider extends BaseProvider {
     let response = null;
 
     for (let i = 0; i < MAX_TOOL_LOOPS; i++) {
+      // 1. Generate content
       const result = await model.generateContent({ contents, tools: tools.length ? tools : undefined });
       response = result?.response || result;
       if (this.aborted.has(job.id)) break;
 
+      // 2. Check for tool calls
       const calls = extractFunctionCalls(response);
-      if (!calls.length) break;
+      if (!calls.length) break; // No tools called, we are done
 
+      // 3. Log calls
+      calls.forEach(c => console.log(`🛠️ Gemini calling tool: ${c.name}`));
+
+      // 4. Add model's request to history
       contents = contents.concat([
         {
           role: "model",
-          parts: calls.map((call) => ({ functionCall: call })),
+          parts: calls.map((call) => ({ functionCall: { name: call.name, args: call.args } })),
         },
       ]);
 
+      // 5. Execute tools and format responses
       const functionResponses = [];
       for (const call of calls) {
         try {
-          const toolResult = await executeMcpTool(call.name, call.args);
+          // Execute via MCP Manager
+          const rawString = await executeMcpTool(call.name, call.args);
+          
+          // --- FIX START: JSON PARSING ---
+          // Gemini needs a structured Object (Struct), not a JSON string.
+          let structuredResponse = { result: rawString };
+
+          try {
+            const trimmed = String(rawString).trim();
+            if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+                 const parsed = JSON.parse(trimmed);
+                 structuredResponse = { result: parsed };
+            }
+          } catch (e) {
+            // parsing failed, use raw string
+          }
+          // --- FIX END ---
+
           functionResponses.push({
             functionResponse: {
               name: call.name,
-              response: toolResult,
+              response: structuredResponse,
             },
           });
         } catch (err) {
+          console.error(`Tool error (${call.name}):`, err);
           functionResponses.push({
             functionResponse: {
               name: call.name,
@@ -135,6 +166,7 @@ export default class GeminiProvider extends BaseProvider {
         }
       }
 
+      // 6. Add tool results to history
       contents = contents.concat([
         {
           role: "function",
@@ -150,7 +182,7 @@ export default class GeminiProvider extends BaseProvider {
       return {
         combinedTail,
         exitInfo: { code: 130, signal: "aborted" },
-        model: GEMINI_MODEL,
+        model: modelName,
         provider: "gemini",
       };
     }
@@ -170,7 +202,7 @@ export default class GeminiProvider extends BaseProvider {
     return {
       combinedTail,
       exitInfo: { code: 0, signal: null },
-      model: GEMINI_MODEL,
+      model: modelName,
       provider: "gemini",
     };
   }
