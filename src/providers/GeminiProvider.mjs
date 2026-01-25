@@ -58,7 +58,12 @@ export default class GeminiProvider extends BaseProvider {
     const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 
     await startMcpServers();
-    const mcpToolDecls = await getAllMcpTools();
+    const mcpToolsRaw = await getAllMcpTools();
+    const mcpToolDecls = mcpToolsRaw.map((t) => ({
+      name: t.name,
+      description: t.description,
+      parameters: t.inputSchema,
+    }));
 
     const useSearch = shouldUseSearch(job.prompt);
 
