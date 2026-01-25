@@ -15,12 +15,12 @@ ensureJobsDirs();
 
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 const { sendMessageSafe, sendDocumentSafe } = createTelegramHelpers(bot);
-const { startWorkerLoop, enqueueJob } = createWorker({ sendMessageSafe, sendDocumentSafe });
+const { startWorkerLoop, enqueueJob, cancelJob } = createWorker({ sendMessageSafe, sendDocumentSafe });
 
 bot.on("polling_error", (err) => {
   console.error("[polling_error]", err?.message || err);
 });
 
-bot.on("message", createMessageHandler({ sendMessageSafe, sendDocumentSafe, enqueueJob }));
+bot.on("message", createMessageHandler({ sendMessageSafe, sendDocumentSafe, enqueueJob, cancelJob }));
 
 startWorkerLoop().catch(() => {});

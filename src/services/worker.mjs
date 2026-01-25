@@ -1,23 +1,23 @@
 import fs from "node:fs";
 import path from "node:path";
-import { spawn } from "node:child_process";
 import {
   CODEX_BIN,
   CODEX_MODEL,
-  CODEX_TIMEOUT_MS,
-  HEARTBEAT_SEC,
+  GEMINI_MODEL,
   JOB_LOGS_DIR,
   MAX_INLINE_OUTPUT_CHARS,
   USE_UNSAFE_CODEX,
   WORKDIR,
 } from "../config.mjs";
-import { buildCodexArgs, makeBigTaskPrompt } from "../commands/codex.mjs";
+import { createProviderManager } from "../providers/index.mjs";
 import { getJob, loadJobs, saveJobs, upsertJob } from "./job-db.mjs";
-import { genJobId, nowIso, parseTokensUsed, shellQuote, sleep } from "../utils/common.mjs";
+import { genJobId, nowIso, parseTokensUsed, sleep } from "../utils/common.mjs";
 
 let workerRunning = false;
 
 export function createWorker({ sendMessageSafe, sendDocumentSafe }) {
+  const providerManager = createProviderManager({ sendMessageSafe });
+
   async function startWorkerLoop() {
     if (workerRunning) return;
     workerRunning = true;
@@ -57,105 +57,62 @@ export function createWorker({ sendMessageSafe, sendDocumentSafe }) {
 
     const chatId = j.chatId;
     const workdir = j.workdir || WORKDIR;
+    const providerName = (j.provider || "codex").toLowerCase();
 
     const logPath = path.join(JOB_LOGS_DIR, `job-${j.id}.log.txt`);
     const metaPath = path.join(JOB_LOGS_DIR, `job-${j.id}.meta.json`);
 
-    fs.writeFileSync(
-      metaPath,
-      JSON.stringify(
-        {
-          id: j.id,
-          createdAt: j.createdAt,
-          startedAt: j.startedAt,
-          workdir,
-          codexBin: CODEX_BIN,
-          codexModel: CODEX_MODEL,
-          unsafeBypass: USE_UNSAFE_CODEX,
-          prompt: j.prompt,
-        },
-        null,
-        2
-      )
-    );
-
-    await sendMessageSafe(chatId, `🚀 Job ${j.id} started.\nWorking dir: ${workdir}\nModel: ${CODEX_MODEL}`);
-
-    const fullPrompt = makeBigTaskPrompt(j.prompt);
-    const args = buildCodexArgs(fullPrompt, workdir);
-
-    const outStream = fs.createWriteStream(logPath, { flags: "a" });
-    outStream.write(
-      `== job ${j.id} ==\nstarted: ${nowIso()}\ncmd: ${CODEX_BIN} ${args
-        .map((a) => JSON.stringify(a))
-        .join(" ")}\n\n`
-    );
-
-    let finished = false;
-    let lastHeartbeat = Date.now();
-
-    const cmdStr = [CODEX_BIN, ...args].map((a) => shellQuote(a)).join(" ");
-
-    const child = spawn("bash", ["-lc", `script -qfc ${shellQuote(cmdStr)} /dev/null`], {
-      cwd: workdir,
-      env: process.env,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-
-    j.pid = child.pid;
-    j.updatedAt = nowIso();
-    upsertJob(db, j);
-    saveJobs(db);
-
-    const heartbeatTimer = setInterval(async () => {
-      if (finished) return;
-      const now = Date.now();
-      if (now - lastHeartbeat >= HEARTBEAT_SEC * 1000) {
-        lastHeartbeat = now;
-        try {
-          await sendMessageSafe(chatId, `⏳ Job ${j.id} still running…`);
-        } catch {
-          // ignore
-        }
-      }
-    }, 1000);
-
-    let combinedTail = "";
-    const tailLimit = 14000;
-
-    const onData = (data) => {
-      const s = data.toString("utf8");
-      outStream.write(s);
-
-      combinedTail += s;
-      if (combinedTail.length > tailLimit) {
-        combinedTail = combinedTail.slice(combinedTail.length - tailLimit);
-      }
+    const meta = {
+      id: j.id,
+      createdAt: j.createdAt,
+      startedAt: j.startedAt,
+      workdir,
+      provider: providerName,
+      prompt: j.prompt,
     };
 
-    child.stdout.on("data", onData);
-    child.stderr.on("data", onData);
+    if (providerName === "codex") {
+      meta.codexBin = CODEX_BIN;
+      meta.codexModel = CODEX_MODEL;
+      meta.unsafeBypass = USE_UNSAFE_CODEX;
+    }
 
-    const killTimer = setTimeout(() => {
-      try {
-        outStream.write(`\n\n[bot] timeout after ${CODEX_TIMEOUT_MS}ms; killing process.\n`);
-      } catch {}
-      try {
-        child.kill("SIGKILL");
-      } catch {}
-    }, CODEX_TIMEOUT_MS);
+    if (providerName === "gemini") {
+      meta.geminiModel = GEMINI_MODEL;
+    }
 
-    const exitInfo = await new Promise((resolve) => {
-      child.on("close", (code, signal) => resolve({ code, signal }));
-      child.on("error", (err) => resolve({ code: 1, signal: "spawn_error", err }));
-    });
+    fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2));
 
-    clearTimeout(killTimer);
-    clearInterval(heartbeatTimer);
-    finished = true;
+    if (providerName === "codex") {
+      await sendMessageSafe(chatId, `🚀 Job ${j.id} started.\nWorking dir: ${workdir}\nModel: ${CODEX_MODEL}`);
+    } else {
+      await sendMessageSafe(
+        chatId,
+        `🚀 Job ${j.id} started.\nProvider: ${providerName}\nWorking dir: ${workdir}\nModel: ${providerName === "gemini" ? GEMINI_MODEL : ""}`.trim()
+      );
+    }
 
-    outStream.write(`\n\nended: ${nowIso()}\nexit: ${JSON.stringify(exitInfo)}\n`);
-    outStream.end();
+    const provider = providerManager.getProvider(providerName);
+
+    let result = null;
+    try {
+      result = await provider.execute(j, {
+        workdir,
+        logPath,
+        onPid: (pid) => {
+          j.pid = pid;
+          j.updatedAt = nowIso();
+          upsertJob(db, j);
+          saveJobs(db);
+        },
+      });
+    } catch (err) {
+      const msg = String(err?.message || err);
+      fs.writeFileSync(logPath, `[provider_error] ${msg}\n`, { flag: "a" });
+      result = { combinedTail: msg, exitInfo: { code: 1, signal: "provider_error" } };
+    }
+
+    const exitInfo = result?.exitInfo || { code: 1, signal: "unknown" };
 
     const db2 = loadJobs();
     const j2 = getJob(db2, j.id);
@@ -174,20 +131,21 @@ export function createWorker({ sendMessageSafe, sendDocumentSafe }) {
 
     const logText = fs.readFileSync(logPath, "utf8");
     const tokens = parseTokensUsed(logText);
+    const modelLabel = result?.model || (providerName === "codex" ? CODEX_MODEL : GEMINI_MODEL);
 
     const captionLines = [
       `📄 Job ${j2.id} ${j2.status.toUpperCase()}`,
-      `Model: ${CODEX_MODEL}`,
+      modelLabel ? `Model: ${modelLabel}` : null,
       tokens ? `Tokens used: ${tokens.toLocaleString()}` : null,
       exitInfo?.code === 0 ? "✅ Completed." : "❌ Completed with errors.",
     ].filter(Boolean);
 
     const tailSummary =
       `🧾 Job ${j2.id} ${j2.status.toUpperCase()}\n` +
-      `Model: ${CODEX_MODEL}\n` +
+      (modelLabel ? `Model: ${modelLabel}\n` : "") +
       (tokens ? `Tokens used: ${tokens.toLocaleString()}\n` : "") +
       `Exit: code=${exitInfo.code} signal=${exitInfo.signal || "none"}\n\n` +
-      `--- Output tail ---\n${combinedTail.trim() || "(no output)"}`;
+      `--- Output tail ---\n${(result?.combinedTail || "").trim() || "(no output)"}`;
 
     if (tailSummary.length <= MAX_INLINE_OUTPUT_CHARS) {
       await sendMessageSafe(chatId, tailSummary);
@@ -206,7 +164,7 @@ export function createWorker({ sendMessageSafe, sendDocumentSafe }) {
     }
   }
 
-  async function enqueueJob(chatId, prompt, { forcedId = null, workdir = null } = {}) {
+  async function enqueueJob(chatId, prompt, { forcedId = null, workdir = null, provider = "codex" } = {}) {
     const db = loadJobs();
     const id = forcedId || genJobId();
 
@@ -222,6 +180,7 @@ export function createWorker({ sendMessageSafe, sendDocumentSafe }) {
       exit: null,
       prompt,
       workdir: workdir || WORKDIR,
+      provider,
     };
 
     upsertJob(db, job);
@@ -231,5 +190,22 @@ export function createWorker({ sendMessageSafe, sendDocumentSafe }) {
     return id;
   }
 
-  return { startWorkerLoop, enqueueJob };
+  async function cancelJob(chatId, id) {
+    const db = loadJobs();
+    const j = getJob(db, id);
+    if (!j || j.chatId !== chatId) return { ok: false, reason: "not_found" };
+    if (j.status !== "running") return { ok: false, reason: "not_running", status: j.status };
+
+    const provider = providerManager.getProvider(j.provider || "codex");
+    await provider.abort(j);
+
+    j.status = "canceled";
+    j.updatedAt = nowIso();
+    upsertJob(db, j);
+    saveJobs(db);
+
+    return { ok: true };
+  }
+
+  return { startWorkerLoop, enqueueJob, cancelJob };
 }
