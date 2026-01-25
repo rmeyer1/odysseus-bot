@@ -10,8 +10,12 @@ import { createTelegramHelpers } from "./src/utils/telegram.mjs";
 import { ensureJobsDirs } from "./src/services/job-db.mjs";
 import { createWorker } from "./src/services/worker.mjs";
 import { createMessageHandler } from "./src/services/message-router.mjs";
+import { startMcpServers } from "./src/services/mcp-manager.mjs";
 
 ensureJobsDirs();
+startMcpServers().catch((err) => {
+  console.error("[mcp] startup failed:", err?.message || err);
+});
 
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 const { sendMessageSafe, sendDocumentSafe } = createTelegramHelpers(bot);

@@ -12,8 +12,11 @@
   "type": "commonjs",
   "dependencies": {
     "@google/generative-ai": "^0.21.0",
+    "@modelcontextprotocol/sdk": "^1.8.0",
+    "@modelcontextprotocol/server-github": "^2025.1.23",
     "dotenv": "^17.2.3",
     "node-pty": "^1.0.0",
-    "node-telegram-bot-api": "^0.67.0"
+    "node-telegram-bot-api": "^0.67.0",
+    "zod": "^3.25.0"
   }
 }

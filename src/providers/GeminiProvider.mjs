@@ -3,8 +3,10 @@ import BaseProvider from "./BaseProvider.mjs";
 import { GEMINI_API_KEY, GEMINI_MODEL } from "../config.mjs";
 import { nowIso, sleep } from "../utils/common.mjs";
 import { getCodexSystemPrompt } from "../commands/codex.mjs";
+import { executeMcpTool, getAllMcpTools, startMcpServers } from "../services/mcp-manager.mjs";
 
 const SYSTEM_PROMPT = getCodexSystemPrompt();
+const MAX_TOOL_LOOPS = 3;
 
 function shouldUseSearch(prompt) {
   const p = String(prompt || "").toLowerCase();
@@ -26,6 +28,21 @@ function extractSources(response) {
   return Array.from(sources);
 }
 
+function extractFunctionCalls(response) {
+  const candidates = response?.candidates || [];
+  const parts = candidates[0]?.content?.parts || [];
+  const calls = [];
+  for (const part of parts) {
+    if (part?.functionCall?.name) {
+      calls.push({
+        name: part.functionCall.name,
+        args: part.functionCall.args || {},
+      });
+    }
+  }
+  return calls;
+}
+
 export default class GeminiProvider extends BaseProvider {
   constructor() {
     super();
@@ -40,7 +57,14 @@ export default class GeminiProvider extends BaseProvider {
     const { GoogleGenerativeAI } = await import("@google/generative-ai");
     const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 
+    await startMcpServers();
+    const mcpToolDecls = await getAllMcpTools();
+
     const useSearch = shouldUseSearch(job.prompt);
+
+    const tools = [];
+    if (useSearch) tools.push({ googleSearch: {} });
+    if (mcpToolDecls.length) tools.push({ functionDeclarations: mcpToolDecls });
 
     const model = genAI.getGenerativeModel({
       model: GEMINI_MODEL,
@@ -48,7 +72,7 @@ export default class GeminiProvider extends BaseProvider {
         role: "system",
         parts: [{ text: SYSTEM_PROMPT }],
       },
-      tools: useSearch ? [{ googleSearch: {} }] : undefined,
+      tools: tools.length ? tools : undefined,
     });
 
     const outStream = fs.createWriteStream(logPath, { flags: "a" });
@@ -68,23 +92,50 @@ export default class GeminiProvider extends BaseProvider {
       }
     };
 
+    let contents = [{ role: "user", parts: [{ text: job.prompt }] }];
     let response = null;
-    let hadChunks = false;
 
-    if (typeof model.generateContentStream === "function") {
-      const streamResult = await model.generateContentStream(job.prompt);
-      for await (const chunk of streamResult.stream) {
-        if (this.aborted.has(job.id)) break;
-        const text = chunk.text();
-        if (text) {
-          hadChunks = true;
-          appendText(text);
+    for (let i = 0; i < MAX_TOOL_LOOPS; i++) {
+      const result = await model.generateContent({ contents, tools: tools.length ? tools : undefined });
+      response = result?.response || result;
+      if (this.aborted.has(job.id)) break;
+
+      const calls = extractFunctionCalls(response);
+      if (!calls.length) break;
+
+      contents = contents.concat([
+        {
+          role: "model",
+          parts: calls.map((call) => ({ functionCall: call })),
+        },
+      ]);
+
+      const functionResponses = [];
+      for (const call of calls) {
+        try {
+          const toolResult = await executeMcpTool(call.name, call.args);
+          functionResponses.push({
+            functionResponse: {
+              name: call.name,
+              response: toolResult,
+            },
+          });
+        } catch (err) {
+          functionResponses.push({
+            functionResponse: {
+              name: call.name,
+              response: { isError: true, error: String(err?.message || err) },
+            },
+          });
         }
       }
-      response = await streamResult.response;
-    } else {
-      const result = await model.generateContent(job.prompt);
-      response = result?.response || result;
+
+      contents = contents.concat([
+        {
+          role: "function",
+          parts: functionResponses,
+        },
+      ]);
     }
 
     if (this.aborted.has(job.id)) {
@@ -99,10 +150,8 @@ export default class GeminiProvider extends BaseProvider {
       };
     }
 
-    if (!hadChunks) {
-      const text = response?.text?.() || "";
-      appendText(text);
-    }
+    const text = response?.text?.() || "";
+    appendText(text);
 
     const sources = extractSources(response);
     if (sources.length) {
