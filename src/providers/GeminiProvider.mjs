@@ -2,11 +2,11 @@ import fs from "node:fs";
 import BaseProvider from "./BaseProvider.mjs";
 import { GEMINI_API_KEY, GEMINI_MODEL } from "../config.mjs";
 import { nowIso, sleep } from "../utils/common.mjs";
-import { getCodexSystemPrompt } from "../commands/codex.mjs";
 import { executeMcpTool, getAllMcpTools, startMcpServers } from "../services/mcp-manager.mjs";
+import { GEMINI_SYSTEM_PROMPT } from "../prompts/gemini.mjs";
 
-const SYSTEM_PROMPT = getCodexSystemPrompt();
-const MAX_TOOL_LOOPS = 5; // Increased slightly for complex GitHub chains
+const SYSTEM_PROMPT = GEMINI_SYSTEM_PROMPT;
+const MAX_TOOL_LOOPS = 20;
 
 function shouldUseSearch(prompt) {
   const p = String(prompt || "").toLowerCase();
