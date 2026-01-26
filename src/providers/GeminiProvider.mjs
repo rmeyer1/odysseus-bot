@@ -6,7 +6,7 @@ import { executeMcpTool, getAllMcpTools, startMcpServers } from "../services/mcp
 import { GEMINI_SYSTEM_PROMPT } from "../prompts/gemini.mjs";
 
 const SYSTEM_PROMPT = GEMINI_SYSTEM_PROMPT;
-const MAX_TOOL_LOOPS = 20;
+const MAX_TOOL_LOOPS = 35;
 
 function shouldUseSearch(prompt) {
   const p = String(prompt || "").toLowerCase();
