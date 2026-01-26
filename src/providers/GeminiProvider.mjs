@@ -10,9 +10,8 @@ const MAX_TOOL_LOOPS = 35;
 
 function shouldUseSearch(prompt) {
   const p = String(prompt || "").toLowerCase();
-  return /\b(latest|current|today|yesterday|news|release|version|pricing|price|score|winner|who won|documentation|docs|search|lookup|find)\b/i.test(
-    p
-  );
+  // Limit to explicit search-intent phrasing to avoid clashing with coding terms
+  return /\b(today|yesterday|news|release date|pricing|who won|documentation|docs)\b/i.test(p);
 }
 
 function extractSources(response) {
@@ -68,7 +67,12 @@ export default class GeminiProvider extends BaseProvider {
       parameters: t.inputSchema,
     }));
 
-    const useSearch = shouldUseSearch(job.prompt);
+    let useSearch = shouldUseSearch(job.prompt);
+
+    if (mcpToolDecls.length > 0 && useSearch) {
+      console.log("⚠️ Disabling Google Search to avoid conflict with MCP Tools");
+      useSearch = false;
+    }
 
     const tools = [];
     if (useSearch) tools.push({ googleSearch: {} });
