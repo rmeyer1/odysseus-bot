@@ -15,6 +15,8 @@ export const CODEX_MODEL = process.env.CODEX_MODEL || "gpt-5.1-codex-max";
 
 export const CODEX_TIMEOUT_MS = Number(process.env.CODEX_TIMEOUT_MS || 60 * 60 * 1000);
 export const USE_UNSAFE_CODEX = String(process.env.USE_UNSAFE_CODEX || "1") === "1";
+export const CODEX_DISABLE_SHELL_SNAPSHOT =
+  String(process.env.CODEX_DISABLE_SHELL_SNAPSHOT || "1") === "1";
 
 export const TELEGRAM_SEND_DELAY_MS = Number(process.env.TELEGRAM_SEND_DELAY_MS || 900);
 export const TELEGRAM_MAX_CHARS = Number(process.env.TELEGRAM_MAX_CHARS || 3500);
