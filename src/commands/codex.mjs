@@ -1,4 +1,8 @@
-import { CODEX_MODEL, USE_UNSAFE_CODEX } from "../config.mjs";
+import {
+  CODEX_DISABLE_SHELL_SNAPSHOT,
+  CODEX_MODEL,
+  USE_UNSAFE_CODEX,
+} from "../config.mjs";
 
 export function buildCodexArgs(prompt, workdir) {
   const args = [];
@@ -7,6 +11,10 @@ export function buildCodexArgs(prompt, workdir) {
 
   // Force a known model for every invocation (unless overridden via env)
   args.push("--model", CODEX_MODEL);
+
+  if (CODEX_DISABLE_SHELL_SNAPSHOT) {
+    args.push("--disable", "shell_snapshot");
+  }
 
   if (USE_UNSAFE_CODEX) {
     args.push("--dangerously-bypass-approvals-and-sandbox");
