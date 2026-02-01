@@ -1,11 +1,11 @@
 import fs from "node:fs";
+import os from "node:os";
 import { spawn } from "node:child_process";
 import {
   CODEX_BIN,
   CODEX_MODEL,
   CODEX_TIMEOUT_MS,
   HEARTBEAT_SEC,
-  USE_UNSAFE_CODEX,
 } from "../config.mjs";
 import { buildCodexArgs, makeBigTaskPrompt } from "../commands/codex.mjs";
 import { nowIso, shellQuote, sleep } from "../utils/common.mjs";
@@ -34,9 +34,23 @@ export default class CodexCliProvider extends BaseProvider {
     let finished = false;
     let lastHeartbeat = Date.now();
 
+    // Prepare the command string
     const cmdStr = [CODEX_BIN, ...args].map((a) => shellQuote(a)).join(" ");
 
-    const child = spawn("bash", ["-lc", `script -qfc ${shellQuote(cmdStr)} /dev/null`], {
+    // Detect OS to determine 'script' command syntax
+    let scriptCmd;
+    if (os.platform() === "darwin") {
+      // macOS (BSD script): uses -F for flush, -q for quiet.
+      // Output file comes BEFORE the command.
+      // We wrap the actual command in "bash -c" so 'script' treats it as a single execution argument.
+      scriptCmd = `script -Fq /dev/null bash -c ${shellQuote(cmdStr)}`;
+    } else {
+      // Linux (util-linux script): uses -f for flush, -q for quiet, -c for command.
+      // Output file comes AFTER the command.
+      scriptCmd = `script -qfc ${shellQuote(cmdStr)} /dev/null`;
+    }
+
+    const child = spawn("bash", ["-lc", scriptCmd], {
       cwd: workdir,
       env: process.env,
       stdio: ["ignore", "pipe", "pipe"],
